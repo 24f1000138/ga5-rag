@@ -19,6 +19,7 @@ def _session(path: Path) -> ort.InferenceSession:
     opts = ort.SessionOptions()
     opts.intra_op_num_threads = int(os.environ.get("ORT_THREADS", "2"))
     opts.inter_op_num_threads = 1
+    opts.enable_cpu_mem_arena = False  # keeps memory low on small free instances
     return ort.InferenceSession(str(path), opts, providers=["CPUExecutionProvider"])
 
 

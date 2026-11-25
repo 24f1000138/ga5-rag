@@ -287,7 +287,8 @@ SAME_RX = re.compile(r"\bsame\b|identical|\bequal\b|match", re.I)
 CLAUSE_SPLIT = re.compile(r"\band\b|,|;|\bvs\.?\b|\bversus\b|compared (?:to|with)|\bwhile\b|\bwhereas\b|\bor\b|\bthan\b", re.I)
 
 
-N_CE = int(__import__("os").environ.get("N_CE", "8"))  # passages sent to the cross-encoder
+N_CE = int(__import__("os").environ.get("N_CE", "5"))  # passages sent to the cross-encoder
+FAST = __import__("os").environ.get("FAST", "1") == "1"  # cosine for sentences / named subjects
 
 
 class RAG:
@@ -295,16 +296,25 @@ class RAG:
         self.emb = Embedder()
         self.ce = Reranker()
         self.P = self.emb.encode(PASSAGES)
+        self.S = [self.emb.encode(ss) for ss in SENTS]
         # warm up
         self.ce.score("warm up", PASSAGES[:2])
 
+    @lru_cache(maxsize=4096)
+    def qvec(self, q: str) -> np.ndarray:
+        return self.emb.encode([q])[0]
+
     # ---- ranking
     def rank(self, q: str, subj: list[int]):
-        qv = self.emb.encode([q])[0]
+        qv = self.qvec(q)
         cos = self.P @ qv
-        cand = set(np.argsort(-cos)[:N_CE].tolist()) | set(subj)
-        cand = sorted(cand)
-        ce = self.ce.score(q, [PASSAGES[i] for i in cand])
+        if subj and FAST:
+            # the question names its subject: skip the slow cross-encoder, use cosine
+            cand = sorted(set(np.argsort(-cos)[:N_CE].tolist()) | set(subj))
+            ce = [10.0 * float(cos[i]) - 3.0 for i in cand]
+        else:
+            cand = sorted(set(np.argsort(-cos)[:N_CE].tolist()) | set(subj))
+            ce = self.ce.score(q, [PASSAGES[i] for i in cand])
         rows = []
         for i, c in zip(cand, ce):
             boost = 4.0 if i in subj else 0.0
@@ -318,7 +328,10 @@ class RAG:
 
     def best_sentence(self, q: str, pidx: int, types: set[str] | None, qwords: set[str] | None = None):
         sents = SENTS[pidx]
-        sc = self.ce.score(q, sents)
+        if FAST and types:  # typed values: regex does the work, cosine picks the sentence
+            sc = 10.0 * (self.S[pidx] @ self.qvec(q)) - 3.0
+        else:
+            sc = self.ce.score(q, sents)
         order = np.argsort(-sc)
         for j in order:
             facts = FACTS[pidx][j]
