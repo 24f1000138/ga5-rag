@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .rag import RAG, abstain
+from .harness import CONFIG as HARNESS_CONFIG, classify_batch
 
 app = FastAPI(title="GA5 RAG service")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -67,6 +68,38 @@ async def query(request: Request):
         out = abstain()
     LOG.append({"t": round(time.time(), 1), "body": raw, "resp": out})
     return JSONResponse(out, headers={"Access-Control-Allow-Origin": "*"})
+
+
+HLOG: deque = deque(maxlen=16)  # last harness batches (request + our answer), readable at /debug/harness
+
+
+@app.get("/harness")
+def harness_config():
+    return JSONResponse(HARNESS_CONFIG, headers={"Access-Control-Allow-Origin": "*"})
+
+
+@app.post("/harness")
+async def harness(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    out = classify_batch(body)
+    HLOG.append({"t": round(time.time(), 1), "body": body, "resp": out})
+    return JSONResponse(out, headers={"Access-Control-Allow-Origin": "*"})
+
+
+@app.get("/debug/harness")
+def debug_harness(i: int = -1):
+    """Without ?i= : summary of logged batches. With ?i=N : full batch N."""
+    items = list(HLOG)
+    if i == -1:
+        return JSONResponse([{"i": n, "t": x["t"], "batchId": x["body"].get("batchId"),
+                              "cases": len(x["body"].get("cases") or [])} for n, x in enumerate(items)],
+                            headers={"Access-Control-Allow-Origin": "*"})
+    return JSONResponse(items[i] if 0 <= i < len(items) else {}, headers={"Access-Control-Allow-Origin": "*"})
 
 
 app = CollapseSlashes(app)
