@@ -1,21 +1,34 @@
+import re
+import time
+from collections import deque
 from functools import lru_cache
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
 from .rag import RAG, abstain
 
 app = FastAPI(title="GA5 RAG service")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+
+class CollapseSlashes:
+    """Treat //query (base URL submitted with a trailing slash) the same as /query."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and "//" in scope.get("path", ""):
+            scope = dict(scope)
+            scope["path"] = re.sub(r"/{2,}", "/", scope["path"])
+            scope["raw_path"] = scope["path"].encode()
+        await self.inner(scope, receive, send)
+
+
 engine = RAG()  # loads both models once at startup
-
-
-class Query(BaseModel):
-    question: str = ""
-    top_k: int = 3
+LOG: deque = deque(maxlen=300)  # last requests, readable at /debug/log
 
 
 @lru_cache(maxsize=2048)
@@ -28,10 +41,32 @@ def root():
     return {"status": "ok", "usage": "POST /query {\"question\": str, \"top_k\": int}"}
 
 
+@app.get("/debug/log")
+def debug_log():
+    return JSONResponse(list(LOG), headers={"Access-Control-Allow-Origin": "*"})
+
+
 @app.post("/query")
-def query(body: Query):  # plain def -> runs in FastAPI's thread pool, so requests overlap
+async def query(request: Request):
+    raw = None
     try:
-        out = dict(_cached(body.question or "", int(body.top_k or 3)))
+        raw = await request.json()
+    except Exception:
+        pass
+    body = raw if isinstance(raw, dict) else {}
+    question = body.get("question") or body.get("query") or ""
+    try:
+        top_k = int(body.get("top_k") or 3)
+    except Exception:
+        top_k = 3
+    try:
+        from starlette.concurrency import run_in_threadpool
+
+        out = dict(await run_in_threadpool(_cached, str(question), top_k))
     except Exception:
         out = abstain()
+    LOG.append({"t": round(time.time(), 1), "body": raw, "resp": out})
     return JSONResponse(out, headers={"Access-Control-Allow-Origin": "*"})
+
+
+app = CollapseSlashes(app)
