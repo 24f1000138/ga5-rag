@@ -1,0 +1,12 @@
+# Render Blueprint: free Docker web service for the GA5 RAG API.
+services:
+  - type: web
+    name: ga5-rag
+    runtime: docker
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: WORKERS
+        value: "1"
+      - key: ORT_THREADS
+        value: "1"
