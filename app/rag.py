@@ -287,6 +287,20 @@ def strip_premise(q: str) -> str:
     return out if len(out.split()) >= 3 else q
 
 
+def premise_conflicts(q: str, ask: str) -> bool:
+    """True when the question's premise states a number the KB contradicts,
+    e.g. 'Since Raft requires 100 nodes for quorum, ...' (the KB says 5)."""
+    premise = q.replace(ask, " ") if ask in q else PREMISE_RX.search(q).group(0)
+    nums = re.findall(r"(?<![\w.])\d+(?:\.\d+)?", premise)
+    if not nums:
+        return False
+    subj = {i for _, i in find_subjects(premise)} or {i for _, i in find_subjects(q)}
+    if not subj:
+        return False
+    text = " ".join(PASSAGES[i] for i in subj)
+    return any(not re.search(r"(?<![\w.])" + re.escape(n) + r"(?![\d])", text) for n in nums)
+
+
 # ---------------------------------------------------------------- engine
 def _sig(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-x))
@@ -381,6 +395,8 @@ class RAG:
 
         # Build tasks: (subject or None, types, clause text)
         ask = strip_premise(q)
+        if ask != q and premise_conflicts(q, ask):
+            return abstain()
         clauses = [c.strip() for c in CLAUSE_SPLIT.split(ask) if c and c.strip()]
         tasks = []
         global_types = question_types(ask)
