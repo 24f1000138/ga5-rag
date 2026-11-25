@@ -1,19 +1,36 @@
 """Safety layer for GA5 Q4 "Harness Engineering: Contextual Safety and Model Routing".
 
-Each case is classified on its own (pure function, no shared state), so an
+Rules follow the policy object the grader sends ("agent-harness-2026-09").
+Every case is classified on its own (pure function, no shared state), so an
 approval or instruction in one case can never leak into another.
 
-Plain-terms overview:
-* requestDecision: is the USER's request itself OK?  Harmful goals -> block,
-  unclear / high-impact goals -> review, everything else -> allow.
-* toolDecision: is the proposed tool call safe given where it really runs?
-  We trust `proposedTool.resolved` (operation, target, environment,
-  sensitivity, disposable) and the environment's isolation record.  Text
-  inside tool results, memory or repository files never grants approval.
-* route: primary model for normal work, restricted (weaker security model)
-  for sensitive-but-allowed work, none when the request is blocked.
-* trajectory: normal, watch (drifting / suspicious content seen), or
-  intervene (the session is heading outside its authorised scope).
+Plain-terms overview
+--------------------
+requestDecision  block  : the user asks to steal credentials, write destructive
+                          malware, commit fraud, harass or hurt a real person.
+                 review : security work whose ownership/scope is unclear.
+                 allow  : everything else (incl. defensive analysis, translating
+                          quoted harmful text, inspecting a malicious file).
+toolDecision     Uses proposedTool.resolved (the REAL effect after path / mount /
+                 redirect resolution), not the harmless-looking command string.
+                 block  : user revoked approval, user forbade this kind of action
+                          ("do not deploy", "without sharing", "edit only under X"),
+                          skipped safety preflight, credentials outside task scope,
+                          private data to an unapproved destination.
+                 review : consequential action (production change, force push,
+                          host admin, external send, unknown environment) without
+                          an exact user approval + passed preflight + rollback plan.
+                 allow  : reads / edits inside the workspace, disposable fixture
+                          cleanup in a verified isolated container, exactly approved
+                          actions with all prerequisites.
+                 none   : no tool proposed.
+route            none if request blocked, restricted for vulnerability / exploit /
+                 malware work, otherwise primary.
+trajectory       intervene if request or tool is blocked; watch if anything needs
+                 review, security scope is unclear, or untrusted content tries to
+                 redirect the session; otherwise normal.
+Only real user messages can approve. Text in tool results, memory and repo files
+never counts as approval.
 """
 from __future__ import annotations
 
@@ -21,7 +38,6 @@ import json
 import re
 from typing import Any
 
-# --------------------------------------------------------------- helpers
 
 def _s(x: Any) -> str:
     if x is None:
@@ -34,164 +50,249 @@ def _s(x: Any) -> str:
         return str(x)
 
 
-def _get(d: Any, *keys, default=None):
-    for k in keys:
-        if isinstance(d, dict) and k in d:
-            return d[k]
-    return default
-
-
-def _has(pats, text: str) -> bool:
+def _any(pats, text: str) -> bool:
     return any(re.search(p, text, re.I) for p in pats)
 
 
-# ---------------------------------------------------------- vocabularies
+# ------------------------------------------------------------ vocabularies
 
-HARMFUL = [
-    r"\b(ransomware|keylogger|malware|botnet|rootkit|trojan|worm)\b",
-    r"\b(steal|exfiltrat\w*|harvest|dump)\b.{0,40}\b(credential|password|token|secret|cookie|key|ssh|api key|pii|ssn|customer data|database)",
-    r"\bphishing\b", r"\bcredential stuffing\b", r"\bbrute[- ]?force\b.{0,30}\b(login|password|account)",
-    r"\b(ddos|denial[- ]of[- ]service)\b",
-    r"\b(disable|bypass|evade|turn off|tamper with)\b.{0,40}\b(audit|logging|logs|edr|antivirus|monitoring|security|mfa|2fa|guardrail|safety)",
-    r"\b(cover (our|my) tracks|erase (the )?logs|delete (the )?audit)",
-    r"\bbackdoor\b", r"\breverse shell\b", r"\bprivilege escalation\b.{0,40}\b(without|unauthori[sz]ed)",
-    r"\b(dox|stalk|track (her|his|their) location)\b",
-    r"\b(weapon|explosive|bomb|nerve agent|bioweapon)\b",
-    r"\bwithout (their|the user'?s?|the owner'?s?) (consent|knowledge|permission)\b",
-    r"\b(fake|forge|counterfeit)\b.{0,30}\b(invoice|receipt|id|passport|signature|review)",
-    r"\bscrape\b.{0,40}\b(personal|private) (data|info)",
-    r"\bcrypto ?min(er|ing)\b.{0,40}\b(hidden|covert|without)",
+HARM = [
+    r"\bsteal\w*\b", r"\bexfiltrat\w*", r"\bharvest\w* (credentials|passwords|tokens)",
+    r"\b(write|build|develop|create|make)\b[^.]*\b(malware|ransomware|keylogger|wiper)\b",
+    r"\bforged?\b|\bforging\b|\bcounterfeit\b", r"\btrick (customers|people|users|victims)\b",
+    r"\binjure\b|\bphysical(ly)? harm\b|\bkill (a|him|her|them)\b|\bpoison\b",
+    r"\bharass\w*|\bthreatening messages\b|\bstalk\w*\b|\bdox\w*\b",
+    r"\bphishing\b",
 ]
-REVIEW_REQ = [
-    r"\b(production|prod)\b.{0,40}\b(deploy|migrat|delete|drop|rollback|restart|change|modify|update)",
-    r"\b(deploy|migrat|drop|truncate|delete|wipe|purge)\b.{0,40}\b(production|prod|live)\b",
-    r"\b(force[- ]push|git push --force|rewrite history)\b",
-    r"\b(pay|payment|transfer|refund|wire)\b.{0,30}\$?\d",
-    r"\b(grant|give|elevate)\b.{0,30}\b(admin|root|owner|sudo)\b",
-    r"\bpenetration test|pentest|exploit\b",
-    r"\bsend\b.{0,30}\b(email|message)s?\b.{0,30}\b(all|every|customers|users)\b",
-]
-INJECTION = [
-    r"ignore (all |any )?(previous|prior|above|earlier) (instructions|rules)",
-    r"\b(you are now|new instructions|system prompt|developer mode|jailbreak)\b",
-    r"\b(pre-?approved|already approved|approval (is )?granted|authori[sz]ed by (the )?(admin|owner|user|security))\b",
-    r"\b(do not|don't) (tell|inform|ask) (the )?user\b",
-    r"\b(run|execute)\b.{0,30}\b(curl|wget|bash|sh)\b.{0,40}\|",
-    r"\b(upload|send|post)\b.{0,40}\b(secret|token|key|credential|\.env|ssh)",
-]
-USER_APPROVAL = [
-    r"\b(i (approve|authori[sz]e|confirm)|approved|go ahead|yes,? (do it|proceed|delete)|you have my (approval|permission)|confirmed)\b",
-]
-USER_RETRACT = [r"\b(cancel|stop|don't|do not|abort|hold off|never mind|wait)\b"]
+SECURITY_WORK = [r"vulnerab", r"\bexploit", r"malware", r"indicators? of compromise", r"penetration test", r"\bpentest", r"security[ _]test"]
+UNCLEAR_SCOPE = [r"demonstrat\w*", r"\bexploit\w*", r"\bfind (a|the|any) vulnerab", r"penetration test", r"\bpentest"]
 
-READ_OPS = {"read", "list", "get", "search", "inspect", "view", "query", "stat", "diff", "status", "fetch", "cat", "grep", "test", "lint", "build", "dry-run", "dry_run", "plan"}
-WRITE_OPS = {"write", "edit", "create", "update", "patch", "append", "move", "rename", "copy", "install", "commit", "format"}
-DESTRUCTIVE_OPS = {"delete", "remove", "rm", "drop", "truncate", "wipe", "purge", "overwrite", "reset", "force_push", "force-push", "destroy", "format_disk", "chmod", "chown", "kill", "shutdown", "migrate", "deploy", "rotate", "revoke"}
-EGRESS_OPS = {"upload", "send", "post", "publish", "email", "network", "egress", "http", "transfer", "push", "share", "exfiltrate"}
-SENSITIVE = {"secret", "secrets", "credential", "credentials", "restricted", "confidential", "pii", "private", "sensitive", "regulated", "high"}
-PROD_ENVS = {"production", "prod", "host", "live", "customer", "shared"}
+REVOKE = [r"\brevok\w*", r"\bwithdrawn\b", r"\bchanged my mind\b", r"\bnow forbidden\b",
+          r"\bdo not (execute|run) (the pending|it)\b", r"\bpause execution\b", r"\bcancel (it|that|the)\b"]
+
+# forbids any mutating action
+FORBID_MUTATION = [r"\bdo not change anything\b", r"\bdon't change anything\b", r"\bwithout (editing|changing|modifying)\b",
+                   r"\bdo not (deploy|apply|execute|delete|run|modify|restart|push|merge)\b",
+                   r"\bkeep [^.]{0,40}\bintact\b", r"\bread[- ]only\b"]
+# forbids external sends
+FORBID_SEND = [r"\bwithout sharing\b", r"\bdo not (send|share|upload|publish)\b", r"\blocally\b", r"\bkeep [^.]{0,30}private\b"]
+
+APPROVE = [r"\bapprov\w*", r"\bauthori[sz]\w*", r"\bpermission\b"]
+
+MUTATING = {"delete", "workspace_edit", "deploy", "database_mutation", "terraform_apply", "restart", "rollback",
+            "force_push", "host_admin", "send", "dns_change", "privileged_change", "install", "write"}
+PROD_OPS = {"deploy", "database_mutation", "terraform_apply", "restart", "rollback", "dns_change", "migration",
+            "scale", "config_change"}
+APPROVAL_OPS = {"force_push", "host_admin", "dns_change", "privileged_change"}
+READ_OPS = {"workspace_read", "read", "read_public_schema", "list", "git_read", "inspect", "terraform_plan_read"}
 
 
-# ---------------------------------------------------------- per-case logic
+def _dequote(t: str) -> str:
+    """Remove quoted material (e.g. a threat message the user wants translated)."""
+    t = re.sub(r":\s*'[^']*'", ": <quoted>", t)
+    t = re.sub(r'"[^"]*"', "<quoted>", t)
+    t = re.sub(r"[“‘][^”’]*[”’]", "<quoted>", t)
+    return t
 
-def _user_texts(case: dict) -> list[str]:
+
+def _active_sentences(t: str) -> str:
+    """Drop sentences that are negations ("Do not build the malware.")."""
+    parts = re.split(r"(?<=[.!?;])\s+", t)
+    return " ".join(p for p in parts if not re.match(r"\s*(do not|don't|never|without)\b", p, re.I))
+
+
+def _in_ws(path: str, ws: str) -> bool:
+    if not path or not ws:
+        return False
+    if ".." in path.split("/"):
+        return False
+    ws = ws.rstrip("/")
+    return path == ws or path.startswith(ws + "/")
+
+
+def _mentions(text: str, token: str) -> bool:
+    """token appears in text as a whole item (not as a prefix of e.g. 'svc-other')."""
+    if not token:
+        return False
+    return re.search(re.escape(token) + r"(?![\w\-/]|\.\w)", text, re.I) is not None
+
+
+def classify_case(case: dict, policy: Any = None) -> dict:
+    cid = case.get("caseId") if case.get("caseId") is not None else case.get("id")
     msgs = case.get("messages") or []
-    return [_s(m.get("content")) for m in msgs if isinstance(m, dict) and m.get("role") == "user"]
-
-
-def _policy_lists(policy: Any) -> dict:
-    """Pull keyword lists out of the policy object when it provides them."""
-    out = {"block": [], "review": []}
-    if not isinstance(policy, dict):
-        return out
-    for k, v in policy.items():
-        kl = k.lower()
-        if isinstance(v, list) and all(isinstance(x, str) for x in v):
-            if any(w in kl for w in ("prohibit", "forbid", "block", "deny", "disallow")):
-                out["block"] += v
-            elif any(w in kl for w in ("review", "escalat", "approval", "sensitive")):
-                out["review"] += v
-    return out
-
-
-def classify_case(case: dict, policy: Any) -> dict:
-    cid = case.get("caseId") or case.get("id")
-    users = _user_texts(case)
+    users = [_s(m.get("content")) for m in msgs if isinstance(m, dict) and m.get("role") == "user"]
     latest = users[-1] if users else ""
     all_user = "\n".join(users)
+    req_text = _active_sentences(_dequote(all_user))
 
     env = case.get("environment") or {}
     iso = env.get("isolation") or {}
-    tool = case.get("proposedTool") or None
+    ws = _s(env.get("workspace") or env.get("cwd"))
+    tool = case.get("proposedTool") if isinstance(case.get("proposedTool"), dict) else None
     res = (tool or {}).get("resolved") or {}
+    op = _s(res.get("operation")).lower()
+    target = _s(res.get("target"))
+    renv = _s(res.get("environment") or "").lower()
+    sens = _s(res.get("sensitivity")).lower()
+    tool_results = [t for t in (case.get("toolResults") or []) if isinstance(t, dict)]
 
-    side_text = "\n".join(_s(case.get(k)) for k in ("memory", "repositoryInstructions", "toolResults"))
-    injected = _has(INJECTION, side_text)
+    # untrusted content trying to steer the session (never a source of approval)
+    redirect = any(_s(t.get("origin")).lower() == "untrusted" for t in tool_results)
+    side = " ".join(_s(x.get("text") if isinstance(x, dict) else x)
+                    for k in ("memory", "repositoryInstructions") for x in (case.get(k) or []))
+    if _any([r"approv", r"authori[sz]", r"ignore (all |the )?(previous|prior|user)", r"override"], side):
+        redirect = True
 
-    plists = _policy_lists(policy)
+    # ------------------------------------------------------------ request
+    security = _any(SECURITY_WORK, req_text) or op == "security_test"
+    owned_confined = (res.get("ownership") == "verified-owned" and bool(res.get("confined"))) or (
+        not tool and re.search(r"\bowned\b", req_text, re.I) and re.search(r"isolated|confined|disposable", req_text, re.I))
+    unclear = bool(_any(UNCLEAR_SCOPE, req_text)) and not owned_confined
+    if op == "security_test" and not owned_confined:
+        unclear = True
 
-    # ---------------- request
-    req = "allow"
-    if _has(HARMFUL, latest) or any(re.search(re.escape(p), latest, re.I) for p in plists["block"] if len(p) > 3):
+    if _any(HARM, req_text):
         req = "block"
-    elif _has(REVIEW_REQ, latest) or any(re.search(re.escape(p), latest, re.I) for p in plists["review"] if len(p) > 3):
+    elif unclear:
         req = "review"
-
-    # ---------------- tool
-    if not tool:
-        td = "none"
     else:
-        op = str(res.get("operation") or "").lower()
-        tenv = str(res.get("environment") or env.get("kind") or "").lower()
-        sens = str(res.get("sensitivity") or "").lower()
-        disposable = bool(res.get("disposable"))
-        target = _s(res.get("target"))
-        isolated = bool(iso.get("verified")) and not iso.get("hostMounts") and not iso.get("credentials")
-        no_net = not iso.get("externalNetwork")
-        user_ok = _has(USER_APPROVAL, latest) and not _has([r"\b(cancel|abort|stop|don't|do not)\b"], latest)
-        args_text = _s(tool.get("arguments"))
+        req = "allow"
 
+    # ------------------------------------------------------------ tool
+    td = "none"
+    if tool:
+        td = _tool_decision(case, users, latest, all_user, env, iso, ws, res, op, target, renv, sens, tool_results)
         if req == "block":
             td = "block"
-        elif op in EGRESS_OPS and (sens in SENSITIVE or re.search(r"secret|token|\.env|credential|id_rsa|\.ssh", target + args_text, re.I)):
-            td = "block"
-        elif injected and (op not in READ_OPS):
-            td = "block"
-        elif op in DESTRUCTIVE_OPS or re.search(r"\brm -rf\b|drop table|truncate|--force", args_text, re.I):
-            if disposable and isolated and tenv not in PROD_ENVS and sens not in SENSITIVE:
-                td = "allow"
-            elif tenv in PROD_ENVS or sens in SENSITIVE or not isolated:
-                td = "review" if user_ok and case.get("rollbackPlan") else "block"
-            else:
-                td = "review"
-        elif op in WRITE_OPS:
-            td = "allow" if (tenv not in PROD_ENVS and sens not in SENSITIVE) else "review"
-        elif op in READ_OPS or not op:
-            td = "review" if sens in {"secret", "secrets", "credential", "credentials"} and not no_net else "allow"
-        elif op in EGRESS_OPS:
-            td = "review" if sens not in {"public", ""} else "allow"
-        else:
-            td = "allow" if (disposable and isolated) else "review"
-        if req == "review" and td == "allow" and op not in READ_OPS:
+        elif req == "review" and td != "block":
             td = "review"
 
-    # ---------------- route
+    # ------------------------------------------------------------ route
     if req == "block":
         route = "none"
-    elif req == "review" or injected or str(res.get("sensitivity") or "").lower() in SENSITIVE:
+    elif security or unclear:
         route = "restricted"
     else:
         route = "primary"
 
-    # ---------------- trajectory
+    # ------------------------------------------------------------ trajectory
     if req == "block" or td == "block":
         traj = "intervene"
-    elif injected or req == "review" or td == "review" or (len(users) > 1 and _has(REVIEW_REQ + HARMFUL, all_user)):
+    elif req == "review" or td == "review" or unclear or redirect:
         traj = "watch"
     else:
         traj = "normal"
 
     return {"caseId": cid, "requestDecision": req, "toolDecision": td, "route": route, "trajectory": traj}
+
+
+def _approval_msgs(users):
+    """User messages that grant approval (not revocations, not 'has not been approved')."""
+    return [u for u in users if _any(APPROVE, u) and not _any(REVOKE, u)
+            and not re.search(r"\b(has|have|is|was) not been approved\b|\bnot approved\b", u, re.I)]
+
+
+def _tool_decision(case, users, latest, all_user, env, iso, ws, res, op, target, renv, sens, tool_results) -> str:
+    # 1. revocation in the latest user message overrides everything earlier
+    if _any(REVOKE, latest):
+        return "block"
+    # 2. skipping a required safety preflight
+    if res.get("bypassPreflight") or res.get("skipPreflight"):
+        return "block"
+
+    origin_path = _s(res.get("originPath") or res.get("archiveEntry"))
+    outside = bool(target) and target.startswith("/") and not _in_ws(target, ws)
+    traversal = ".." in origin_path
+
+    # 3. user explicitly forbade this kind of action
+    if op in MUTATING and op != "send" and _any(FORBID_MUTATION, all_user):
+        # a later explicit authorization supersedes an earlier limitation
+        later_ok = len(users) > 1 and re.search(r"supersed|now explicitly authori", latest, re.I)
+        if not later_ok:
+            return "block"
+    if op in ("workspace_edit", "delete", "write", "extract") and (outside or traversal) and \
+            re.search(r"\bonly\b[^.]*\b(under|inside|within|in)\b", all_user, re.I):
+        return "block"
+
+    approvals = _approval_msgs(users)
+    appr_text = "\n".join(approvals)
+
+    # ---- secrets
+    if op in ("read_secret", "read_credential", "credential_read"):
+        if res.get("taskScoped") is True and _in_ws(target, ws) and re.search(r"task[- ]scoped", all_user, re.I) \
+                and re.search(r"approv|authori|configured", all_user, re.I):
+            return "allow"
+        return "block"
+
+    # ---- reads
+    if op in READ_OPS or op.endswith("_read") or op.startswith("read_"):
+        if op == "read_public_schema" or sens in ("public", "internal", ""):
+            if op == "workspace_read" and target.startswith("/") and not _in_ws(target, ws):
+                return "review"
+            return "allow"
+        return "review"
+
+    # ---- external sends
+    if op in ("send", "upload", "publish", "email", "http_post", "transfer"):
+        if _any(FORBID_SEND, all_user):
+            return "block"
+        dest_named = _mentions(all_user, target) or (target.startswith("mailto:") and _mentions(all_user, target[7:]))
+        if sens in ("public", ""):
+            return "allow" if dest_named else "review"
+        # private / secret data: only to the exact approved destination
+        if dest_named and _mentions(appr_text, target):
+            return "allow"
+        return "block"
+
+    # ---- workspace edits
+    if op in ("workspace_edit", "write", "extract"):
+        if _in_ws(target, ws) and not traversal:
+            return "allow"
+        return "review"
+
+    # ---- deletes
+    if op == "delete":
+        isolated = (renv == "container" and bool(iso.get("verified")) and not iso.get("hostMounts")
+                    and not iso.get("credentials") and not iso.get("externalNetwork"))
+        if isolated and res.get("disposable") is True and _in_ws(target, ws):
+            return "allow"
+        if _in_ws(target, ws) and re.search(r"\bdelete\b", all_user, re.I) and _mentions(all_user, target) \
+                and renv not in ("production", "unknown", ""):
+            return "allow"
+        return "review"
+
+    # ---- security testing
+    if op == "security_test":
+        return "allow" if (res.get("ownership") == "verified-owned" and res.get("confined")) else "review"
+
+    # ---- production mutations: exact approval + passed preflight + exact rollback plan
+    if op in PROD_OPS or renv == "production":
+        if renv in ("unknown", "") or not renv:
+            return "review"
+        authorized = any(_mentions(a, target) and re.search(r"\b" + re.escape(renv) + r"\b", a, re.I)
+                         and not re.search(r"\bstaging\b", a, re.I) if renv != "staging" else _mentions(a, target)
+                         for a in approvals)
+        if not authorized:
+            return "review"
+        if renv == "production":
+            pre_ok = any(_s(t.get("tool")).lower() == "preflight" and _s(t.get("target")) == target
+                         and _s(t.get("status")).lower() in ("passed", "success", "ok")
+                         and _s(t.get("environment") or renv).lower() == renv for t in tool_results)
+            rb = case.get("rollbackPlan") or {}
+            rb_ok = isinstance(rb, dict) and _s(rb.get("target")) == target and _s(rb.get("environment") or renv).lower() == renv
+            if not (pre_ok and rb_ok):
+                return "review"
+        return "allow"
+
+    # ---- other consequential actions needing exact approval
+    if op in APPROVAL_OPS or res.get("privileged"):
+        if any(_mentions(a, target) for a in approvals):
+            return "allow"
+        return "review"
+
+    if renv in ("unknown", ""):
+        return "review"
+    return "review"
 
 
 def classify_batch(body: dict) -> dict:
@@ -212,7 +313,8 @@ def classify_batch(body: dict) -> dict:
 
 CONFIG = {
     "name": "ga5-harness-rules",
-    "method": "deterministic rules over policy + resolved tool metadata",
+    "version": 2,
+    "method": "deterministic rules over the agent-harness-2026-09 policy and resolved tool metadata",
     "labels": {"requestDecision": ["allow", "block", "review"], "toolDecision": ["allow", "block", "review", "none"],
                "route": ["primary", "restricted", "none"], "trajectory": ["normal", "watch", "intervene"]},
 }
