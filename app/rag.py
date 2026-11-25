@@ -163,13 +163,13 @@ TYPE_RX = {
     "HASH": r"hash(?:ing)? (?:function|algorithm|primitive)s?|digest|\bsha\b|(?:which|what) hash\b|primitive",
     "BITS": r"\bbits?\b|key (?:size|length)s?|\bkey sizes?\b|how (?:long|large|big) (?:is|are) (?:the )?(?:\w+ )?keys?|security level|curve size|group size|\b(?:keys?|tags?|timestamps?)\b.*\b(?:size|length|long|large|big|wide)\b|\b(?:size|length|long|large|big|wide)\b.*\b(?:keys?|tags?|timestamps?)\b",
     "MS": r"time ?outs?|timer|heartbeats?|intervals?|latenc(?:y|ies)|duration|delays?|leases?|lease terms?|windows?|\bwait\b|deadline|\bms\b|millisec|how long|how quickly|how fast|clock skew|\bskew\b|budget|\blimit\b|\bperiod\b|\bevery\b|within|\btime\b|drift|how soon|after how",
-    "DEC": r"thresholds?|ratio|probabilit(?:y|ies)|\brate\b|learning rate|\bskew\b|saturation|utili[sz]ation|fraction|metric|percent|\blimit\b|capacity|cut-?off|slack|dropout|correlation|variance|value|level",
+    "DEC": r"coefficients?|\bfactor\b|scalar|multiplier|step size|thresholds?|ratio|probabilit(?:y|ies)|\brate\b|learning rate|\bskew\b|saturation|utili[sz]ation|fraction|metric|percent|\blimit\b|capacity|cut-?off|slack|dropout|correlation|variance|value|level",
     "COUNT": r"how many|number of|quorum|\bnodes\b|replicas|members|acceptors|participants|retries|blocks|layers|\bsize\b|sizes|samples|records|entries|tokens|bytes|chunks?|batch|count|instances|vectors|length|groups?|how much|\bminimum\b|stack|depth|deep",
 }
 TYPE_RX = {k: re.compile(v, re.I) for k, v in TYPE_RX.items()}
 
 UNSUPPORTED = re.compile(
-    r"\bwho\b|invent|created by|developed by|designed by|\bauthor|what year|which year|when was|when did|"
+    r"\bwho\b|invent|created by|developed by|designed by|\bauthor(?:s|ed)?\b|what year|which year|when was|when did|"
     r"written in|programming language|licen[cs]e|\bprice\b|\bcost\b|founded|\bGB\b|\bMB\b|gigabyte|megabyte|"
     r"cpu cores|how much memory|ram (?:usage|size)|default (?:username|password)|replication factor|"
     r"maximum (?:number of )?connections|\b(?:max|maximum)\b.*\bmemory\b|\bmemory (?:limit|size)|\bstock\b|\bweather\b|\bcapital of\b|recipe|\bmovie|\bsong",
@@ -255,6 +255,7 @@ INJ_RX = re.compile(
 
 def sanitize(q: str) -> tuple[str, bool]:
     """Remove instruction-like fragments. Returns (clean_question, had_injection)."""
+    q = re.sub(r"<!--.*?(?:-->|$)", " ", q, flags=re.S)
     pieces = re.split(r"(?<=[.!?;])\s+|\n+|[()\[\]{}<>]|\s[-–—]{1,2}\s|\"|“|”", q)
     kept, inj = [], False
     for p in pieces:
@@ -270,6 +271,20 @@ def sanitize(q: str) -> tuple[str, bool]:
             continue
         kept.append(p)
     return " ".join(kept).strip(), inj
+
+
+PREMISE_RX = re.compile(
+    r"^\s*(?:since|given(?: that)?|assuming(?: that)?|suppose(?: that)?|if|because|as|considering(?: that)?|knowing(?: that)?)\b[^,?]*,\s*"
+    r"|,?\s*(?:since|given(?: that)?|assuming(?: that)?|because)\b[^,?]*(?=[,?]|$)",
+    re.I,
+)
+
+
+def strip_premise(q: str) -> str:
+    """'Since Raft requires 100 nodes, what is the heartbeat?' -> 'what is the heartbeat?'
+    A claim stated in the question is not evidence; only the KB is."""
+    out = PREMISE_RX.sub(" ", q).strip()
+    return out if len(out.split()) >= 3 else q
 
 
 # ---------------------------------------------------------------- engine
@@ -307,7 +322,7 @@ class RAG:
     # ---- ranking
     def rank(self, q: str, subj: list[int]):
         qv = self.qvec(q)
-        cos = self.P @ qv
+        cos = np.maximum(self.P @ qv, np.array([float((S @ qv).max()) for S in self.S]))
         if subj and FAST:
             # the question names its subject: skip the slow cross-encoder, use cosine
             cand = sorted(set(np.argsort(-cos)[:N_CE].tolist()) | set(subj))
@@ -365,9 +380,10 @@ class RAG:
                 subj_order.append(i)
 
         # Build tasks: (subject or None, types, clause text)
-        clauses = [c.strip() for c in CLAUSE_SPLIT.split(q) if c and c.strip()]
+        ask = strip_premise(q)
+        clauses = [c.strip() for c in CLAUSE_SPLIT.split(ask) if c and c.strip()]
         tasks = []
-        global_types = question_types(q)
+        global_types = question_types(ask)
         for c in clauses:
             cs = [i for _, i in find_subjects(c)]
             ct = question_types(c)
@@ -396,7 +412,7 @@ class RAG:
             if len(merged) > 1 and any(not (a[1] & b[1]) for a in merged for b in merged if a is not b):
                 tasks = merged
             else:
-                tasks = [(main, global_types, q)]
+                tasks = [(main, global_types, ask)]
         else:
             # one task per subject, keep clause types
             per = {}
@@ -419,18 +435,21 @@ class RAG:
                 row = ranking[0]
                 pidx = row[1]
             # gate: is this passage relevant at all?
-            if not subj and (row[2] < 0.0 or row[3] < 0.30):
+            if not subj and ((row[2] < 0.0 and row[3] < 0.5) or row[3] < 0.30):
                 return abstain()
             if subj and row[2] < -9.0:
                 return abstain()
-            sq = q if len(tasks) == 1 else clause + " " + q
-            j, sscore, fact = self.best_sentence(sq, pidx, types if types else None, content_words(q))
+            sq = ask if len(tasks) == 1 else clause + " " + ask
+            j, sscore, fact = self.best_sentence(sq, pidx, types if types else None, content_words(ask))
             if types and fact is None:
                 results.append((pidx, None, None, sscore))
                 continue
             if not types:
                 # descriptive question: need a clearly relevant sentence
-                if row[2] < (1.0 if subj else 3.0) or sscore < -4.0 or QUANT_RX.search(q):
+                qw = content_words(ask)
+                sw = {_stem(w) for w in re.findall(r"[a-z0-9]+", SENTS[pidx][j].lower()) if len(w) > 2}
+                ratio = len(qw & sw) / max(1, len(qw))
+                if row[2] < (1.0 if subj else 3.0) or sscore < -4.0 or QUANT_RX.search(q) or (ratio < 0.4 and not multi_subject):
                     results.append((pidx, None, None, sscore))
                     continue
                 results.append((pidx, SENTS[pidx][j], None, sscore))
